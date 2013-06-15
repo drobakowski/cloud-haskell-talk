@@ -1,6 +1,7 @@
 {-# LANGUAGE DeriveDataTypeable, GeneralizedNewtypeDeriving, 
 TupleSections, ScopedTypeVariables, TemplateHaskell, DeriveGeneric #-}
 
+import System.IO
 import Control.Concurrent (threadDelay)
 
 import System.Environment (getArgs)
@@ -37,6 +38,8 @@ import Data.DeriveTH
 
 import Data.Set (Set)
 import qualified Data.Set as Set
+import Data.Map (Map)
+import qualified Data.Map as Map
 
 --import Data.IORef
 --import qualified Data.Set as S
@@ -52,6 +55,8 @@ data Pong = Pong ProcessId deriving (Generic, Typeable)
 
 data Foo = Foo
     deriving (Generic)
+
+newtype MonitorRefTypeable = MonitorRefTypeable MonitorRef deriving (Generic, Typeable, Show)
 
 -- GHC will automatically fill out the instance
 --instance Binary Foo
@@ -137,104 +142,171 @@ newClient (sendP, "hello") = do liftIO . putStrLn $ "Master started: "
 
 type ChatServerSearchReply = Maybe ProcessId
 
-data ChatProtocol = JoinChat { clientName :: String,
-                                clientPid :: ProcessId }
-                  | LeaveChat { clientPid :: ProcessId }
-                  deriving (Generic, Typeable, Show)
+--data ChatProtocol = JoinChat { clientName :: String,
+--                                clientPid :: ProcessId }
+--                  | ChatMessage { from :: ProcessId,
+--                                   msg :: String, num :: Integer }
+--                  | LeaveChat { clientPid :: ProcessId }
+--                  deriving (Generic, Typeable, Show)
+
+data JoinChatMessage = JoinChat { clientName :: String,
+                                   clientPid :: ProcessId }
+                     deriving (Generic, Typeable, Show)
+
+data ChatMessage = ChatMessage {     from :: ProcessId,
+                                  message :: String }
+                 deriving (Generic, Typeable, Show)
 
 --instance Binary ChatProtocol
 -- derive uses TH to generate the instance automatically
-$( derive makeBinary ''ChatProtocol )
+$( derive makeBinary ''JoinChatMessage )
+$( derive makeBinary ''ChatMessage )
+$( derive makeBinary ''MonitorRefTypeable)
+
+type ChatServerClient = (String, MonitorRefTypeable)
+type ChatServerClients = [ChatServerClient]
+
+type ChatServerClientMap = Map ProcessId ChatServerClient
+
+mkChatServerClient :: String -> MonitorRef -> ChatServerClient
+mkChatServerClient name monitorRef = (name, MonitorRefTypeable monitorRef)
+
+mkJoinChatMessage :: ProcessId -> String -> JoinChatMessage
+mkJoinChatMessage pid msg = JoinChat {clientPid = pid, clientName = msg}
+
+mkChatMessage :: ProcessId -> String -> ChatMessage
+mkChatMessage pid msg = ChatMessage {from = pid, message = msg}
+
+chatClientName :: ChatServerClient -> String
+chatClientName (name, _) = name
 
 --data ChatServerSearchReply = Found ProcessId
 --                           | NotFound
 --                           deriving (Generic, Typeable)
 
-searchChatServer :: Backend -> Process ChatServerSearchReply
-searchChatServer backend = do
+searchChatServer :: Backend -> String -> Process ChatServerSearchReply
+searchChatServer backend chatRoom = do
     peers <- liftIO $ findPeers backend 2000
     searchChatServer' peers
     where
         searchChatServer' :: [NodeId] -> Process ChatServerSearchReply
         searchChatServer' (peer:tail) = do
-            whereisRemoteAsync peer "MASTER"
+            whereisRemoteAsync peer chatRoom
             WhereIsReply name remoteWhereIs <- expect
             case remoteWhereIs of
-                Just masterPid -> do
-                    --liftIO . putStrLn $ "Found master with PID: " ++ show masterPid
-                    return (Just masterPid)
-                otherwise -> searchChatServer' tail
+                Just masterPid -> return (Just masterPid)
+                otherwise      -> searchChatServer' tail
 
         searchChatServer' [] = return Nothing
 
-initChatServer :: Backend -> Process ProcessId
-initChatServer backend = do
-    --peers <- liftIO $ findPeers backend 2000
-    --csReply <- searchChatServer peers
-    csReply <- searchChatServer backend
+initChatServer :: Backend -> String -> Process ProcessId
+initChatServer backend chatRoom = do
+    csReply <- searchChatServer backend chatRoom
 
     case csReply of
         Nothing -> do
             -- Start the chat server on this node
             masterPid <- getSelfPid
-            register "MASTER" masterPid
+            register chatRoom masterPid
             return masterPid
         Just masterPid -> return masterPid
 
-startChatServer :: Backend -> Process ()
-startChatServer backend = do
-    masterPid <- initChatServer backend
+startChatServer :: Backend -> String -> Process ()
+startChatServer backend chatRoom = do
+    masterPid <- initChatServer backend chatRoom
     self <- getSelfPid
-    serve masterPid self
-    where
-        serve pid self
-            | pid == self = do
-                            liftIO . putStrLn $ "Starting Chat Server with PID: " ++ show pid ++ "..."
-                            forever $ receiveWait
-                                [match clienIsJoiningChat
-                                --match (\_ -> return ())
-                                ]
+    say "Starting Chat Server..."
+    let
+        serve pid self (clients :: ChatServerClientMap)
+            | pid == self = serverLoop self clients
             | otherwise = liftIO . putStrLn $ "Chat Server already started with the PID: " ++ show pid ++ "..."
 
-        clienIsJoiningChat :: ChatProtocol -> Process ()
-        clienIsJoiningChat (JoinChat {clientName=name, clientPid=chatClientPid}) = do
-            --liftIO . putStrLn $ name ++ " is joining the chat..."
-            clientMonitorRef <- monitor chatClientPid
-            --Set.insert clientMonitorRef Set.empty
-            liftIO . putStrLn $ name ++ " is joining the chat..."
+    serve masterPid self Map.empty
+    where
+        serverLoop self (clients :: ChatServerClientMap) =
+            receiveWait
+                [
+                 match (\(ChatMessage {from=pid, message=msg}) -> do
+                            broadcastMessage self pid (": " ++ msg) clients
+                            serverLoop self clients
+                       ),
+                 match (\(JoinChat {clientName=name, clientPid=chatClientPid}) -> do
+                            clientMonitorRef <- monitor chatClientPid
+                            let newClients = Map.insert chatClientPid (mkChatServerClient name clientMonitorRef) clients
+                            broadcastMessage self chatClientPid " is joining the chat..." newClients
+                            serverLoop self newClients
+                        ),
+                 match (\(ProcessMonitorNotification monitorRef processId _) -> do
+                            broadcastMessage self processId " is leaving the chat..." clients
+                            serverLoop self $ Map.delete processId clients
+                       ),
+                 match (\(message :: String) -> do
+                            say message
+                            serverLoop self clients
+                       )
+                ]
+        broadcastMessage :: ProcessId -> ProcessId -> String -> ChatServerClientMap -> Process ()
+        broadcastMessage serverPid from message clients = do
+            let client = clients Map.! from
+            let groupMsg = chatClientName client ++ message
+            mapM_ (\(clientPid, chatClient) -> send clientPid $ mkChatMessage serverPid groupMsg) . filter (\(clientPid, _) -> from /= clientPid) $ Map.toList clients
 
 
---startChatClient :: Backend -> String -> Process ()
-startChatClient backend name = do
+-- Beispiele
+-- TODO: Chat history
+-- Room chat server
+-- Link => Server <- Clients, damit alles Clients sterben sobald der Server weg ist / Note that link provides unidirectional linking
+-- Monitor => Server -> Clients, damit der Server merkt das Clients weg sind
+-- Say => Logging
+-- Data ChatMessage vs. ChatProtocl => Probeleme bei mehreren Verzweigungen... Wahrscheinlich durch derive, Serializable selber implementieren
+-- Sending String vs. => Data / send serverPid (msg :: String) <=> send serverPid $ mkChatMessage self msg),
+-- Match vs. MatchIf
+-- Search Server => findPeers / register on Node
+-- Register master in Registry
+
+
+
+startChatClient :: Backend -> String -> String -> Process ()
+startChatClient backend chatRoom name = do
     chatClientPid <- getSelfPid
-    csReply <- searchChatServer backend
+    csReply <- searchChatServer backend chatRoom
 
     case csReply of
         Just chatServerPid -> do
+            link chatServerPid
+
             liftIO . putStrLn $ "Chat Server found!..."
 
-            
-
             -- joining the chat
-            send chatServerPid (JoinChat {clientName=name, clientPid=chatClientPid})
+            send chatServerPid $ mkJoinChatMessage chatClientPid name
 
+            -- spwan the terminal input process to watch for user input
             consoleInputPid <- spawnLocal $ forever $ consoleInputProcess
 
+            -- handle the user chat clint logic
             forever $ handleChatClient consoleInputPid chatServerPid
 
             where
                 consoleInputProcess :: Process ()
                 consoleInputProcess = do
                     pid <- getSelfPid
+                    liftIO . putStr $ "Message: "
+                    liftIO $ hFlush stdout
                     msg <- liftIO getLine
-                    send chatClientPid (pid, msg)
+                    if not $ null msg
+                        then send chatClientPid $ mkChatMessage pid msg
+                        else return ()
 
                 handleChatClient :: ProcessId -> ProcessId -> Process ()
                 handleChatClient consolePid serverPid = do
                     self <- getSelfPid
                     receiveWait [
-                        matchIf (\(sender, msg) -> consolePid == sender)
-                                (\(sender, msg) -> send serverPid (self, msg :: String))
+                        matchIf (\(ChatMessage {from = pid, message = msg}) -> consolePid == pid)
+                                (\(ChatMessage {from = pid, message = msg}) -> do
+                                    --send serverPid (msg :: String)
+                                    send serverPid $ mkChatMessage self msg),
+                        matchIf (\(ChatMessage {from = pid, message = msg}) -> pid == serverPid)
+                                (\(ChatMessage {from = pid, message = msg}) -> liftIO . putStrLn $ "\r" ++ msg) 
                         ]
 
         Nothing -> liftIO . putStrLn $ "No Chat Server found..."
@@ -250,7 +322,7 @@ chatClient name backend node = do
 
     peers <- liftIO $ findPeers backend 2000
 
-    searchChatServer backend
+    searchChatServer backend "MASTER"
 
     liftIO . putStrLn $ "Slaves: " ++ show peers
 
@@ -364,18 +436,18 @@ main = do
             backend <- configSimpleLocalnetBackend host port
             startSlave backend
         
-        ["chat_server", port] -> do
+        ["chat_server", port, chatRoom] -> do
             distributedContext <- initializeBackend "localhost" port remoteTable
             node <- newLocalNode distributedContext
 
-            runProcess node (startChatServer distributedContext)
+            runProcess node (startChatServer distributedContext chatRoom)
 
         
-        ["chat_client", name, port] -> do
+        ["chat_client", name, port, chatRoom] -> do
             distributedContext <- initializeBackend "localhost" port remoteTable
             node <- newLocalNode distributedContext
 
-            runProcess node (startChatClient distributedContext name)
+            runProcess node (startChatClient distributedContext chatRoom name)
             --peers <- findPeers distributedContext 2000
             --liftIO . putStrLn $ "Slaves: " ++ show peers
             ----otherClients <- findSlaves distributedContext
