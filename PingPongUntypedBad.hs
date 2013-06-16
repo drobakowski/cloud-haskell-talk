@@ -67,16 +67,25 @@ pingServer = do
 pingClient :: ProcessId -> Process ()
 pingClient serverPid = do
     self <- getSelfPid
+
     send serverPid (Ping self)
     
-    -- !!!! ERROR when sending Pong!
-    --send serverPid (Pong self)
     Pong serverPid <- expect
     liftIO . putStrLn $ "Got pong from: " ++ show serverPid
     liftIO $ threadDelay (1*1000000)
     pingClient serverPid
 
-remotable ['pingServer, 'pingClient]
+pingClientBad :: ProcessId -> Process ()
+pingClientBad serverPid = do
+    self <- getSelfPid
+    
+    send serverPid (Pong self)
+
+    liftIO . putStrLn $ "Got pong from: " ++ show serverPid
+    liftIO $ threadDelay (1*1000000)
+    pingClientBad serverPid
+
+remotable ['pingServer, 'pingClient, 'pingClientBad]
 
 master :: Backend -> [NodeId] -> Process ()
 master backend slaves = do
@@ -85,7 +94,16 @@ master backend slaves = do
 
     serverPid <- spawn node $ staticClosure $(mkStatic 'pingServer)
 
+    monitor serverPid
+
     forM_ slaves $ \slave -> spawn slave $ $(mkClosure 'pingClient) (serverPid)
+    
+    liftIO $ threadDelay (1*1000000)
+
+    let badSlave = head slaves
+    spawn badSlave $ $(mkClosure 'pingClientBad) (serverPid)
+
+    receiveWait [ match $ \(ProcessMonitorNotification monitorRef pid reason) -> liftIO . putStrLn $ "Process: " ++ (show pid) ++ " died with reason: " ++ (show reason) ]
 
     _ <- liftIO getLine
     terminateAllSlaves backend

@@ -58,37 +58,59 @@ $( derive makeBinary ''PingPongMessage )
 
 pingServer :: Process ()
 pingServer = do
+    self <- getSelfPid
+    liftIO . putStrLn $ "Starting Chat Server on port: " ++ show self
     Ping from <- expect
     liftIO . putStrLn $ "Got ping from: " ++ show from
-    self <- getSelfPid
     send from (Pong self)
     pingServer
 
 pingClient :: ProcessId -> Process ()
 pingClient serverPid = do
     self <- getSelfPid
+
     send serverPid (Ping self)
     
-    -- !!!! ERROR when sending Pong!
-    --send serverPid (Pong self)
     Pong serverPid <- expect
     liftIO . putStrLn $ "Got pong from: " ++ show serverPid
     liftIO $ threadDelay (1*1000000)
     pingClient serverPid
 
-remotable ['pingServer, 'pingClient]
+pingClientBad :: ProcessId -> Process ()
+pingClientBad serverPid = do
+    self <- getSelfPid
+    
+    send serverPid (Pong self)
+
+    liftIO . putStrLn $ "Got pong from: " ++ show serverPid
+    liftIO $ threadDelay (1*1000000)
+    pingClientBad serverPid
+
+remotable ['pingServer, 'pingClient, 'pingClientBad]
 
 master :: Backend -> [NodeId] -> Process ()
 master backend slaves = do
 
-    node <- getSelfNode
+    forever $ do
+        node <- getSelfNode
 
-    serverPid <- spawn node $ staticClosure $(mkStatic 'pingServer)
+        serverPid <- spawn node $ staticClosure $(mkStatic 'pingServer)
 
-    forM_ slaves $ \slave -> spawn slave $ $(mkClosure 'pingClient) (serverPid)
+        monitor serverPid
 
-    _ <- liftIO getLine
-    terminateAllSlaves backend
+        clients <- mapM (\slave -> spawn slave $ $(mkClosure 'pingClient) (serverPid)) slaves
+        
+        liftIO $ threadDelay (1*1000000)
+
+        let badSlave = head slaves
+        badClient <- spawn badSlave $ $(mkClosure 'pingClientBad) (serverPid)
+
+        receiveWait [ match $ \(ProcessMonitorNotification monitorRef pid reason) -> do
+                                    liftIO . putStrLn $ "Process: " ++ (show pid) ++ " died with reason: " ++ (show reason)
+                                    forM_ (badClient : clients) $ \pid -> kill pid "now"
+                    ]
+
+    --terminateAllSlaves backend
 
 configSimpleLocalnetBackend :: String -> String -> IO Backend
 configSimpleLocalnetBackend host port = initializeBackend host port $ __remoteTable initRemoteTable

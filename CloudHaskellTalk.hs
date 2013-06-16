@@ -165,6 +165,7 @@ $( derive makeBinary ''MonitorRefTypeable)
 
 type ChatServerClient = (String, MonitorRefTypeable)
 type ChatServerClients = [ChatServerClient]
+type ChatMessageHistory = [String]
 
 type ChatServerClientMap = Map ProcessId ChatServerClient
 
@@ -185,76 +186,91 @@ chatClientName (name, _) = name
 --                           deriving (Generic, Typeable)
 
 searchChatServer :: Backend -> String -> Process ChatServerSearchReply
-searchChatServer backend chatRoom = do
-    peers <- liftIO $ findPeers backend 2000
-    searchChatServer' peers
+searchChatServer backend chatRoom =
+    searchChatServer' =<< liftIO (findPeers backend 2000)
     where
         searchChatServer' :: [NodeId] -> Process ChatServerSearchReply
-        searchChatServer' (peer:tail) = do
+        searchChatServer' (peer : tail) = do
+
+            flip send "Message while searching for a chat server..." =<< getSelfPid
+
             whereisRemoteAsync peer chatRoom
+
             WhereIsReply name remoteWhereIs <- expect
             case remoteWhereIs of
-                Just masterPid -> return (Just masterPid)
-                otherwise      -> searchChatServer' tail
+                Just chatServerPid -> return (Just chatServerPid)
+                otherwise          -> searchChatServer' tail
 
         searchChatServer' [] = return Nothing
 
 initChatServer :: Backend -> String -> Process ProcessId
-initChatServer backend chatRoom = do
-    csReply <- searchChatServer backend chatRoom
+initChatServer backend chatRoom =
+    reply =<< searchChatServer backend chatRoom
+    where
+        reply :: ChatServerSearchReply -> Process ProcessId
+        reply Nothing = do
+            chatServerPid <- getSelfPid
+            register chatRoom chatServerPid
+            return chatServerPid
+        reply $ Just chatServerPid = return chatServerPid
 
-    case csReply of
-        Nothing -> do
-            -- Start the chat server on this node
-            masterPid <- getSelfPid
-            register chatRoom masterPid
-            return masterPid
-        Just masterPid -> return masterPid
 
 startChatServer :: Backend -> String -> Process ()
 startChatServer backend chatRoom = do
-    masterPid <- initChatServer backend chatRoom
-    self <- getSelfPid
-    say "Starting Chat Server..."
-    let
-        serve pid self (clients :: ChatServerClientMap)
-            | pid == self = serverLoop self clients
+    foundChatServerPid <- initChatServer backend chatRoom
+    serve foundChatServerPid =<< getSelfPid
+    where
+        serve :: ProcessId -> ProcessId -> Process ()
+        serve pid self
+            | pid == self = say "Starting Chat Server..." >> serverLoop self Map.empty []
             | otherwise = liftIO . putStrLn $ "Chat Server already started with the PID: " ++ show pid ++ "..."
 
-    serve masterPid self Map.empty
-    where
-        serverLoop self (clients :: ChatServerClientMap) =
+        serverLoop :: ProcessId -> ChatServerClientMap -> ChatMessageHistory -> Process()
+        serverLoop self clients msgHistory =
             receiveWait
                 [
                  match (\(ChatMessage {from=pid, message=msg}) -> do
-                            broadcastMessage self pid (": " ++ msg) clients
-                            serverLoop self clients
+                            let message = ": " ++ msg
+                            say $ show pid ++ message
+                            broadcastMessage self pid message clients
+                            serverLoop self clients (message : msgHistory)
                        ),
                  match (\(JoinChat {clientName=name, clientPid=chatClientPid}) -> do
+                            say $ name ++ " is joining the chat..."
                             clientMonitorRef <- monitor chatClientPid
                             let newClients = Map.insert chatClientPid (mkChatServerClient name clientMonitorRef) clients
                             broadcastMessage self chatClientPid " is joining the chat..." newClients
-                            serverLoop self newClients
+                            sendMsgHistoryToNewClient self chatClientPid $ reverse msgHistory
+                            serverLoop self newClients msgHistory
                         ),
                  match (\(ProcessMonitorNotification monitorRef processId _) -> do
+                            say $ show processId ++ " is leaving the chat..."
                             broadcastMessage self processId " is leaving the chat..." clients
-                            serverLoop self $ Map.delete processId clients
+                            serverLoop self (Map.delete processId clients) msgHistory
                        ),
                  match (\(message :: String) -> do
-                            say message
-                            serverLoop self clients
-                       )
+                            say $ "Unkown message recieved: " ++ message
+                            serverLoop self clients msgHistory
+                       ),
+                 matchUnknown $ serverLoop self clients msgHistory
                 ]
+
         broadcastMessage :: ProcessId -> ProcessId -> String -> ChatServerClientMap -> Process ()
         broadcastMessage serverPid from message clients = do
             let client = clients Map.! from
             let groupMsg = chatClientName client ++ message
             mapM_ (\(clientPid, chatClient) -> send clientPid $ mkChatMessage serverPid groupMsg) . filter (\(clientPid, _) -> from /= clientPid) $ Map.toList clients
 
+        sendMsgHistoryToNewClient :: ProcessId -> ProcessId -> ChatMessageHistory -> Process ()
+        sendMsgHistoryToNewClient serverPid _ [] = return ()
+        sendMsgHistoryToNewClient serverPid clientPid (msg : tail) = send clientPid (mkChatMessage serverPid msg) >> sendMsgHistoryToNewClient serverPid clientPid tail
+
 
 -- Beispiele
--- TODO: Chat history
+-- TODO: Chat history, Reconnect der Clients beim server falls Server down...
 -- Room chat server
+-- MessageQueue => Other Message bei der registrierung! Interessant, da erst expect sich die gewünscht holt und die andere liegen lässt / => matchUnkown leert die Queue
+-- Tail recursive
 -- Link => Server <- Clients, damit alles Clients sterben sobald der Server weg ist / Note that link provides unidirectional linking
 -- Monitor => Server -> Clients, damit der Server merkt das Clients weg sind
 -- Say => Logging
@@ -282,6 +298,7 @@ startChatClient backend chatRoom name = do
 
             -- spwan the terminal input process to watch for user input
             consoleInputPid <- spawnLocal $ forever $ consoleInputProcess
+            link consoleInputPid
 
             -- handle the user chat clint logic
             forever $ handleChatClient consoleInputPid chatServerPid
@@ -289,6 +306,7 @@ startChatClient backend chatRoom name = do
             where
                 consoleInputProcess :: Process ()
                 consoleInputProcess = do
+                    link chatClientPid
                     pid <- getSelfPid
                     liftIO . putStr $ "Message: "
                     liftIO $ hFlush stdout
@@ -421,6 +439,7 @@ configSimpleLocalnetBackend host port = initializeBackend host port $ __remoteTa
 main :: IO ()
 main = do
     let host = "localhost"
+    --let host = getHostName
 
     --[port, serverType | _] <- getArgs
 
@@ -437,14 +456,14 @@ main = do
             startSlave backend
         
         ["chat_server", port, chatRoom] -> do
-            distributedContext <- initializeBackend "localhost" port remoteTable
+            distributedContext <- initializeBackend host port remoteTable
             node <- newLocalNode distributedContext
 
             runProcess node (startChatServer distributedContext chatRoom)
 
         
         ["chat_client", name, port, chatRoom] -> do
-            distributedContext <- initializeBackend "localhost" port remoteTable
+            distributedContext <- initializeBackend host port remoteTable
             node <- newLocalNode distributedContext
 
             runProcess node (startChatClient distributedContext chatRoom name)
@@ -458,7 +477,7 @@ main = do
         [serverType, port] -> do
             -- Set up the context
             --hostName <- getHostName
-            distributedContext <- initializeBackend "localhost" port remoteTable
+            distributedContext <- initializeBackend host port remoteTable
             -- The first thing a context lets you do is create a node.
             node <- newLocalNode distributedContext
             peers <- findPeers distributedContext 2000
