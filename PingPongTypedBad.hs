@@ -22,20 +22,25 @@ data PongMessage = Pong
 data PingMessage = Ping (SendPort PongMessage)
                  deriving (Generic, Typeable)
 
+--instance Binary ChatProtocol
+-- derive uses TH to generate the instance automatically
 $( derive makeBinary ''PingMessage )
 $( derive makeBinary ''PongMessage )
 
 pingServer :: ReceivePort PingMessage -> Process ()
 pingServer rcvPort = do
     (Ping fromPort) <- receiveChan rcvPort
+    --Ping from <- expect
     liftIO . putStrLn $ "Got ping from: " ++ show fromPort
     sendChan fromPort Pong
     pingServer rcvPort
 
-pingClient :: SendPort PingMessage -> Process ()
+pingClient :: SendPort PongMessage -> Process ()
 pingClient serverSPort = do
-    (sendPort, rcvPort) <- newChan
-    sendChan serverSPort (Ping sendPort)
+    liftIO . putStrLn $ "Got pong from server"
+    (_sendPort, rcvPort) <- newChan
+    --sendChan serverSPort (Ping sendPort)
+    sendChan serverSPort Pong
     Pong <- receiveChan rcvPort
     
     liftIO . putStrLn $ "Got pong from server"
@@ -51,12 +56,17 @@ master backend slaves = do
 
     (sendPort :: SendPort PingMessage, rcvPort :: ReceivePort PingMessage) <- newChan
 
+    -- BROKEN IMPLEMENTATION! => working progress
+    -- It's the way mkClosure works, it forgets the type. It takes all Data with are !Serializable!
+    -- Kein core dump oder crash!
     forM_ slaves $ \slave -> spawn slave $ $(mkClosure 'pingClient) (sendPort :: SendPort PingMessage)
+    forM_ slaves $ \slave -> spawn slave $ $(mkClosure 'pingClient) (1 :: Integer)
 
     pingServer rcvPort
 
 configSimpleLocalnetBackend :: String -> String -> IO Backend
 configSimpleLocalnetBackend host port = initializeBackend host port $ __remoteTable initRemoteTable
+
 
 main :: IO ()
 main = do

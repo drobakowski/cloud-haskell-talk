@@ -5,7 +5,6 @@ import Control.Concurrent (threadDelay)
 
 import System.Environment (getArgs)
 import Control.Distributed.Process
-
 import Control.Distributed.Process.Backend.SimpleLocalnet
 import Control.Distributed.Process.Closure
 
@@ -22,29 +21,42 @@ data PingPongMessage = Ping ProcessId
                      | Pong ProcessId
                      deriving (Generic, Typeable)
 
+--instance Binary ChatProtocol
+-- derive uses TH to generate the instance automatically
 $( derive makeBinary ''PingPongMessage )
 
 pingServer :: Process ()
 pingServer = forever $ do
-    Ping from <- expect
-    liftIO . putStrLn $ "Got ping from: " ++ show from
-    self <- getSelfPid
-    send from (Pong self)
+    m <- expect
+    case m of
+      Ping from -> do
+        liftIO . putStrLn $ "Got ping from: " ++ show from
+        self <- getSelfPid
+        send from (Pong self)
+      _ -> liftIO . putStrLn $ "Got other msg"
 
 pingClient :: ProcessId -> Process ()
 pingClient serverPid = do
     self <- getSelfPid
+
     send serverPid (Ping self)
     
-    -- !!!! ERROR when sending Pong!
-    send serverPid (Pong self)
-
     Pong from <- expect
     liftIO . putStrLn $ "Got pong from: " ++ show from
     liftIO $ threadDelay (1*1000000)
     pingClient serverPid
 
-remotable ['pingServer, 'pingClient]
+pingClientBad :: ProcessId -> Process ()
+pingClientBad serverPid = do
+    self <- getSelfPid
+    
+    liftIO . putStrLn $ "sending 'bad' message to server..."
+    send serverPid (Pong self)
+
+    liftIO $ threadDelay (1*1000000)
+    pingClientBad serverPid
+
+remotable ['pingServer, 'pingClient, 'pingClientBad]
 
 master :: Backend -> [NodeId] -> Process ()
 master backend slaves = do
@@ -53,7 +65,16 @@ master backend slaves = do
 
     serverPid <- spawn node $ staticClosure $(mkStatic 'pingServer)
 
+    _ <- monitor serverPid
+
     forM_ slaves $ \slave -> spawn slave $ $(mkClosure 'pingClient) (serverPid)
+    
+    liftIO $ threadDelay (1*1000000)
+
+    let badSlave = head slaves
+    _ <- spawn badSlave $ $(mkClosure 'pingClientBad) (serverPid)
+
+    receiveWait [ match $ \(ProcessMonitorNotification _monitorRef pid reason) -> liftIO . putStrLn $ "Process: " ++ (show pid) ++ " died with reason: " ++ (show reason) ]
 
     _ <- liftIO getLine
     terminateAllSlaves backend
@@ -78,4 +99,5 @@ main = do
             startSlave backend
         other -> do
             putStrLn $ "Unkown command: " ++ show other
+
 
